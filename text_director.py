@@ -1541,7 +1541,7 @@ def _table_rows(value: Any) -> list[list[Any]]:
     raise DirectorError("编辑表格格式无效。")
 
 
-def tables_to_script(role_table: Any, segment_table: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+def tables_to_script(role_table: Any, segment_table: Any, *, validate_voice_settings: bool = True) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     role_rows = _table_rows(role_table)
     segment_rows = _table_rows(segment_table)
     roles: dict[str, dict[str, Any]] = {}
@@ -1551,14 +1551,14 @@ def tables_to_script(role_table: Any, segment_table: Any) -> tuple[dict[str, dic
         role_id = str(row[0]).strip()
         name = str(row[1]).strip()
         kind = str(row[2]).strip()
-        voice_id = str(row[5]).strip()
+        voice_id = str(row[5] or "").strip()
         voice_style = str(row[4]).strip()
         rhythm_preset = str(row[6]).strip()
-        if not role_id or not name or kind not in ROLE_KINDS or not voice_id:
-            raise DirectorError(f"角色表第 {row_number} 行包含无效角色或音色。")
-        if not voice_style:
+        if not role_id or not name or kind not in ROLE_KINDS:
+            raise DirectorError(f"角色表第 {row_number} 行包含无效角色。")
+        if validate_voice_settings and not voice_style:
             raise DirectorError(f"角色表第 {row_number} 行必须选择音色预设或填写高级提示。")
-        if rhythm_preset not in RHYTHM_PRESETS:
+        if validate_voice_settings and rhythm_preset not in RHYTHM_PRESETS:
             raise DirectorError(f"角色表第 {row_number} 行包含未知角色节奏预设：{rhythm_preset}")
         if role_id in roles:
             raise DirectorError(f"角色表存在重复轨道ID：{role_id}")
@@ -1634,13 +1634,25 @@ def _build_voice_catalog(
     demo_voices: dict[str, str],
     uploaded_files: Iterable[str] | None,
     generated_files: Iterable[str] | None = None,
+    *,
+    required_voice_ids: Iterable[str] | None = None,
 ) -> dict[str, Path]:
-    catalog = {voice_id: (demo_dir / voice_id).resolve() for voice_id in demo_voices}
+    required = None if required_voice_ids is None else {voice_id for voice_id in required_voice_ids if voice_id}
+    catalog = {
+        voice_id: (demo_dir / voice_id).resolve()
+        for voice_id in demo_voices
+        if required is None or voice_id in required
+    }
     for voice_id, path in catalog.items():
         if not path.is_file():
             raise DirectorError(f"内置音色文件不存在：{voice_id}")
     for raw_path in [*(uploaded_files or []), *(generated_files or [])]:
         path = Path(str(raw_path)).resolve()
+        aliases = {path.name}
+        if path.stem.startswith(("voice-", "legacy-")):
+            aliases.add(path.stem)
+        if required is not None and required.isdisjoint(aliases):
+            continue
         if not path.is_file():
             raise DirectorError(f"上传音色文件不存在：{path.name}")
         if path.suffix.lower() not in {".wav", ".mp3", ".flac", ".m4a", ".ogg"}:
@@ -1712,14 +1724,29 @@ def render_directed_audio(
     progress: Callable[..., Any] | None = None,
     cancel_event: Any | None = None,
 ) -> tuple[str, str, str, str]:
-    roles, segments = tables_to_script(role_table, segment_table)
+    roles, segments = tables_to_script(role_table, segment_table, validate_voice_settings=False)
     pronunciation_rules = normalize_pronunciations(pronunciation_table)
     forced_orders = {int(order) for order in (force_segment_orders or [])}
     fragment_orders = {int(order) for order in (fragment_only_orders or [])}
     if fragment_orders:
         forced_orders.update(fragment_orders)
-    catalog = _build_voice_catalog(demo_dir, demo_voices, uploaded_files, generated_files)
-    for role in roles.values():
+    selected_segments = [segment for segment in segments if not fragment_orders or segment["order"] in fragment_orders]
+    if fragment_orders and len(selected_segments) != len(fragment_orders):
+        missing = sorted(fragment_orders - {segment["order"] for segment in selected_segments})
+        raise DirectorError(f"待重新生成的分句不存在：{missing}")
+    required_role_ids = {segment["speaker_id"] for segment in selected_segments}
+    required_roles = [role for role_id, role in roles.items() if role_id in required_role_ids]
+    required_voice_ids = {role["voice_id"] for role in required_roles}
+    catalog = _build_voice_catalog(
+        demo_dir, demo_voices, uploaded_files, generated_files, required_voice_ids=required_voice_ids,
+    )
+    for role in required_roles:
+        if not role["voice_id"]:
+            raise DirectorError(f"角色 {role['name']} 尚未选择音色。请回到角色卡片选择或生成音色")
+        if not role["voice_condition"]:
+            raise DirectorError(f"角色 {role['name']} 必须选择音色预设或填写高级提示。")
+        if role["rhythm_preset"] not in RHYTHM_PRESETS:
+            raise DirectorError(f"角色 {role['name']} 包含未知角色节奏预设：{role['rhythm_preset']}")
         if role["voice_id"] not in catalog:
             available = "、".join(catalog)
             raise DirectorError(f"角色 {role['name']} 的音色ID不存在：{role['voice_id']}。可用：{available}")
@@ -1749,13 +1776,9 @@ def render_directed_audio(
         cache_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[dict[str, Any]] = []
     reused_segments = 0
-    voice_digests = {voice_id: _file_digest(path) for voice_id, path in catalog.items() if voice_id in {role["voice_id"] for role in roles.values()}}
+    voice_digests = {voice_id: _file_digest(path) for voice_id, path in catalog.items() if voice_id in required_voice_ids}
     try:
         with model_lock:
-            selected_segments = [segment for segment in segments if not fragment_orders or segment["order"] in fragment_orders]
-            if fragment_orders and len(selected_segments) != len(fragment_orders):
-                missing = sorted(fragment_orders - {segment["order"] for segment in selected_segments})
-                raise DirectorError(f"待重新生成的分句不存在：{missing}")
             for index, segment in enumerate(selected_segments, start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     raise DirectorCancelled("音频生成已取消。")
